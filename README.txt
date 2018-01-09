@@ -2,7 +2,8 @@
 This repository contains an experimental software implementation of a
 delegatable and error-tolerant algorithm for counting of six-vertex 
 subgraphs in a graph using the "Camelot" framework 
-(BjÃ¶rklund and Kaski 2016, https://doi.org/10.1145/2933057.2933101 )
+(Björklund and Kaski 2016, https://doi.org/10.1145/2933057.2933101 )
+and (Kaski 2018, https://doi.org/10.1137/1.9781611975055.16 )
 
 ------------------------------------------------------------------------------
 
@@ -10,7 +11,7 @@ The source code is subject to the following license.
 
 The MIT License (MIT)
 
-Copyright (c) 2017 P. Kaski
+Copyright (c) 2017-2018 P. Kaski
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

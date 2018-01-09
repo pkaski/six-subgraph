@@ -4,13 +4,14 @@
  * delegatable and error-tolerant algorithm for counting of six-vertex 
  * subgraphs in a graph using the "Camelot" framework 
  * (Björklund and Kaski 2016, https://doi.org/10.1145/2933057.2933101 )
- * 
+ * and (Kaski 2018, https://doi.org/10.1137/1.9781611975055.16 ) 
+ *
  * 
  * The source code is subject to the following license.
  * 
  * The MIT License (MIT)
  * 
- * Copyright (c) 2017 P. Kaski
+ * Copyright (c) 2017-2018 P. Kaski
  * 
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -48,7 +49,7 @@
 
 typedef long int   index_t;   // 64-bit signed index type
 
-/********************************* Threshold for parallelizing simple loops. */
+/********************************* Threshold for paralellizing simple loops. */
 
 index_t par_threshold = (1L << 20);
 
@@ -207,7 +208,9 @@ T *dev_array_allocate(size_t n)
     }
     size_t size = sizeof(T)*n;
     T *p;
+
     CUDA_WRAP(cudaMalloc(&p, size));
+
     dev_alloc_balance++;
 
     alloc_track_t *t = new alloc_track_t;
@@ -389,6 +392,7 @@ bool m_quorem_layers        = false;
 bool m_quorem_layers_detail = false;
 
 bool m_gpu_scan             = false;
+bool m_gpu_transpose        = false;
 bool m_gpu_mul              = false;
 bool m_gpu_yates            = false;
 bool m_gpu_strassen         = false;
@@ -1405,6 +1409,7 @@ void host_ss_mul(index_t d, index_t n, const F *x, const F *y, F *z)
     F *zp = zef;
     for(index_t c = 0; c < (1L << calls); c++) {
         ss_mul(block, m+1, xp, yp, zp);
+//        host_ss_mul(block, m+1, xp, yp, zp);
         xp = xp + (1L << (block + m + 1));
         yp = yp + (1L << (block + m + 1));
         zp = zp + (1L << (block + m + 1));      
@@ -2838,7 +2843,7 @@ void test_gcd(void)
 template <typename F>
 void test_gcd_perf(void)
 {
-    for(index_t u = 0; u <= 24; u++) {
+    for(index_t u = 0; u <= 20; u++) {
         index_t g = 1L << u;
         index_t n = 2*g;
         index_t m = 2*g;
@@ -2917,7 +2922,7 @@ void test_rs(void)
 template <typename F>
 void test_rs_perf(void) 
 {
-    for(index_t dd = 0; dd <= 24; dd++) {
+    for(index_t dd = 0; dd <= 20; dd++) {
         index_t d = 1L << dd;
         index_t e = 2*d;
         F *src = array_allocate<F>(d+1);
@@ -2953,7 +2958,7 @@ void test_rs_perf(void)
 template <typename F>
 void test_mul_perf(void)
 {
-    for(index_t k = 0; k <= 30; k++) {
+    for(index_t k = 0; k <= 25; k++) {
         index_t n = 1L << k;
         Poly<F> f = Poly<F>::rand(n);
         Poly<F> g = Poly<F>::rand(n);
@@ -2970,7 +2975,7 @@ template <typename F>
 void test_quorem(void) 
 {   
     index_t trials = 1;
-    for(index_t u = 6; u <= 29; u++) {
+    for(index_t u = 6; u <= 25; u++) {
         index_t n = (1L << u);
         for(index_t t = 0; t < trials; t++) {
             Poly<F> a = Poly<F>::rand(n);
@@ -2996,7 +3001,7 @@ void test_eval_interp(void)
 {
 
     index_t trials = 1;
-    for(index_t u = 6; u <= 24; u++) {
+    for(index_t u = 6; u <= 20; u++) {
         index_t n = (1L << u);
         for(index_t r = 0; r < trials; r++) {
             F *u = array_allocate<F>(n);
@@ -3094,15 +3099,14 @@ void gpu_montgomery_test(void)
 template <typename F>
 void test_F()
 {
-
-//    test_gcd<F>();
-//    test_rs<F>();
     gpu_montgomery_test<F>();
     test_mul_perf<F>();
-//    test_quorem<F>();
-//    test_eval_interp<F>();
-//    test_rs_perf<F>();
-//    test_gcd_perf<F>();
+    test_quorem<F>();
+    test_eval_interp<F>();
+    test_gcd<F>();
+    test_rs<F>();
+    test_gcd_perf<F>();
+    test_rs_perf<F>();
 }
 
 /*****************************************************************************/
@@ -3146,21 +3150,34 @@ void transpose(index_t N,   // volume of data array
                index_t M_v, // product of lengths of dimensions below v
                index_t m_u, // length of dimension u
                index_t M_u, // product of lengths of dimensions below u
-               F *d_data)
+               F *d_data,
+               F *d_scratch,
+               bool leave_to_scratch = false)
 {
+
+    metric_push(m_gpu_transpose);
+
     // Sanity-check the parameters
     assert(N >= 0 && M_u >= 0 && M_v >= 0 && m_u >= 0 && m_v >= 0);
     assert(N % (m_v*M_v) == 0);
     assert(N % (m_u*M_u) == 0);
     assert(M_v % (m_u*M_u) == 0);
 
-    F *d_scratch = dev_array_allocate<F>(N);
     index_t db = 1024;
     index_t dg = (N+db-1)/db;
+    
     ker_transpose<<<dg,db>>>(N, m_v, M_v, m_u, M_u, d_data, d_scratch);
     CUDA_SYNC;
-    dev_array_copy(N, d_scratch, d_data);    
-    dev_array_delete(d_scratch);
+    if(!leave_to_scratch)
+        dev_array_copy(N, d_scratch, d_data);    
+
+    double time = metric_time(m_gpu_transpose);
+    double trans_bytes = 2*N*sizeof(F);
+    metric_pop(m_gpu_transpose,
+               "transpose: "
+               "N = %12ld (%6.2lfGiB/s)",
+               N,
+               trans_bytes/(1L << 30)/(time/1000.0));
 }
 
 /************************************************** Stretch from N to N x P. */
@@ -3210,7 +3227,7 @@ void stretch(index_t N,     // volume of input array
  */
 
 /* 
- * Scan inside a warp with Kepler warp shuffle (intrinsics).
+ * Scan inside a warp with warp shuffle (intrinsics).
  *
  */
 
@@ -3220,11 +3237,11 @@ __device__ F scan_warp(F warp)
     const uint lane = threadIdx.x & 31;
 
     for(int delta = 1; delta < 32; delta*=2) {
-        F acc = warp*F(__shfl_up(warp.raw(), delta), true);
+        F acc = warp*F(__shfl_up_sync(0xFFFFFFFFU, warp.raw(), delta), true);
         warp = (lane < delta) ? warp : acc;
     }
 
-    F acc = F(__shfl_up(warp.raw(), 1), true);
+    F acc = F(__shfl_up_sync(0xFFFFFFFFU, warp.raw(), 1), true);
     warp = (lane == 0) ? F(1) : acc;
 
     return warp;
@@ -3709,7 +3726,7 @@ void ker_47_yates_level4(index_t grid_size, index_t lo_mod,
 }
 
 template TEMPLATE_F4X7
-void gpu_47_yates4(index_t D, index_t k, index_t p, F *d_in, F *d_out)
+void gpu_47_yates4(index_t D, index_t k, index_t p, F *d_in, F *d_out, F *d_s0, F *d_s1)
 {   
     assert(k >= 1);
     assert(p % 4 == 0);
@@ -3730,11 +3747,13 @@ void gpu_47_yates4(index_t D, index_t k, index_t p, F *d_in, F *d_out)
         index_t grid_size = D*index_pow(4,l)*1*index_pow(7,k-l-1)*p/4;
         index_t lo_mod    =                    index_pow(7,k-l-1)*p/4;
 
-        if(l == 0)
+        if(l == 0) {
             d_b0 = d_in;
-        if(l < k-1)
-            d_b1 = dev_array_allocate<F>(b1_size);
-        else
+            d_b1 = d_s0;
+        }
+        if(l == 1)
+            d_b1 = d_s1;
+        if(l == k-1)
             d_b1 = d_out;
 
         index_t db = 1024;
@@ -3747,9 +3766,9 @@ void gpu_47_yates4(index_t D, index_t k, index_t p, F *d_in, F *d_out)
                         (scalar4_t *) d_b1);
         CUDA_SYNC;
 
-        if(l > 0)
-            dev_array_delete(d_b0);
+        F *d_t = d_b0;
         d_b0 = d_b1;
+        d_b1 = d_t;
 
         double time = metric_time(m_gpu_yates);
         double trans_bytes = grid_size*(7+4)*sizeof(scalar4_t);
@@ -3807,7 +3826,7 @@ void ker_74_yates_level4(index_t grid_size, index_t lo_mod,
 }
 
 template TEMPLATE_F4X7
-void gpu_74_yates4(index_t D, index_t k, index_t p, F *d_in, F *d_out)
+void gpu_74_yates4(index_t D, index_t k, index_t p, F *d_in, F *d_out, F *d_s)
 {   
     assert(k >= 1);
     assert(p % 4 == 0);
@@ -3828,12 +3847,12 @@ void gpu_74_yates4(index_t D, index_t k, index_t p, F *d_in, F *d_out)
         index_t grid_size = D*index_pow(4,k-l-1)*1*index_pow(7,l)*p/4;
         index_t lo_mod    =                        index_pow(7,l)*p/4;
 
-        if(l == 0)
+        if(l == 0) {
             d_b0 = d_in;
-        if(l < k-1)
-            d_b1 = dev_array_allocate<F>(b1_size);
-        else
-            d_b1 = d_out;
+            d_b1 = (k % 2 == 0) ? d_s : d_out;
+        }
+        if(l == 1)
+            d_b1 = (k % 2 == 0) ? d_out : d_s;
 
         index_t db = 1024;
         index_t dg = (grid_size + db - 1)/db;
@@ -3845,9 +3864,9 @@ void gpu_74_yates4(index_t D, index_t k, index_t p, F *d_in, F *d_out)
                         (scalar4_t *) d_b1);
         CUDA_SYNC;
 
-        if(l > 0)
-            dev_array_delete(d_b0);
+        F *d_t = d_b0;
         d_b0 = d_b1;
+        d_b1 = d_t;
 
         double time = metric_time(m_gpu_yates);
         double trans_bytes = grid_size*(7+4)*sizeof(scalar4_t);
@@ -3949,8 +3968,10 @@ void gpu_4x4_mul(index_t transpose_right, index_t N,
 
 template <typename F>
 void gpu_strassen(index_t transpose_right, index_t k, index_t p, 
-                  F *d_a, F *d_b, F *d_c)
+                  F *d_a, F *d_b, F *d_c, 
+                  F *d_aS, F *d_bS, F *d_cS)
 {
+
     metric_push(m_gpu_strassen);
     push_time();
 
@@ -3958,44 +3979,39 @@ void gpu_strassen(index_t transpose_right, index_t k, index_t p,
 
     assert(k >= 2);
     int n = 1L << k;
-    F *d_aS = dev_array_allocate<F>(4*index_pow(7,k-2)*p*4);
-    F *d_bS = dev_array_allocate<F>(4*index_pow(7,k-2)*p*4);
-    F *d_cS = dev_array_allocate<F>(4*index_pow(7,k-2)*p*4);
 
     // Transpose operands
-    transpose(n*n*p, p, 4, 4, 1, d_a);
+    transpose(n*n*p, p, 4, 4, 1, d_a, d_aS);
     if(d_a != d_b)
-        transpose(n*n*p, p, 4, 4, 1, d_b);
+        transpose(n*n*p, p, 4, 4, 1, d_b, d_bS);
     // Operands have dimensions 4^{k-1} x P x 4
 
     // Strassen-transform operands
-    gpu_74_yates4 STRASSEN_A_TEMPLATE (4, k-2, p*4, d_a, d_aS);
+    gpu_74_yates4 STRASSEN_A_TEMPLATE (4, k-2, p*4, d_a, d_aS, d_cS);
     if(transpose_right)
-        gpu_74_yates4 STRASSEN_B_T_TEMPLATE (4, k-2, p*4, d_b, d_bS);        
+        gpu_74_yates4 STRASSEN_B_T_TEMPLATE (4, k-2, p*4, d_b, d_bS, d_cS);
     else
-        gpu_74_yates4 STRASSEN_B_TEMPLATE   (4, k-2, p*4, d_b, d_bS);
+        gpu_74_yates4 STRASSEN_B_TEMPLATE   (4, k-2, p*4, d_b, d_bS, d_cS);
 
     // Mid-layer data has dimensions 4 x 7^{k-2} x P x 4
     // Execute 4 x 4 matrix mul on MSD x LSD
     gpu_4x4_mul(transpose_right, 4*index_pow(7,k-2)*p*4, d_aS, d_bS, d_cS);
 
     // Inverse-Strassen-transform the result
-    gpu_47_yates4 STRASSEN_C_TEMPLATE (4, k-2, p*4, d_cS, d_c);
+    gpu_47_yates4 STRASSEN_C_TEMPLATE (4, k-2, p*4, d_cS, d_bS, 
+                                       (k % 2 == 0) ? d_aS : d_bS, 
+                                       (k % 2 == 0) ? d_bS : d_aS);
 
     // Transpose result
-    transpose(n*n*p, 4, p, p, 1, d_c);
+    transpose(n*n*p, 4, p, p, 1, d_bS, d_c, true);
     // Result has dimensions 4^{k} x P
 
     // Restore original input (unless overwritten by result)
     if(d_a != d_c)
-        transpose(n*n*p, 4, p, p, 1, d_a);
+        transpose(n*n*p, 4, p, p, 1, d_a, d_aS);
     if(d_b != d_a && d_b != d_c)
-        transpose(n*n*p, 4, p, p, 1, d_b);   
+        transpose(n*n*p, 4, p, p, 1, d_b, d_bS);   
     // Input has dimensions 4^{k} x P 
-
-    dev_array_delete(d_cS);       
-    dev_array_delete(d_bS);
-    dev_array_delete(d_aS);
 
     gpu_mm_time += pop_time();
 
@@ -4013,8 +4029,6 @@ void gpu_strassen(index_t transpose_right, index_t k, index_t p,
                mul_sim_count/(1e9)/(time/1000.0),
                mul_actual_count/(1e9)/(time/1000.0),
                mul_cubic_count/(1e9)/(time/1000.0));
-
-
 }
 
 /*****************************************************************************/
@@ -4384,14 +4398,13 @@ void gpu_coeff(index_t p, index_t k, index_t first,
                coeff_tab<F> &pre,
                F *d_alpha, 
                F *d_beta, 
-               F *d_gamma)
+               F *d_gamma,
+               F *d_lagrange_base,
+               F *d_lagrange,
+               F *d_s)
 {
     index_t R = index_pow(7, k);
     assert(first >= 0);
-    index_t R_round = ((R+8192-1)/8192)*8192;
-    
-    F *d_lagrange_base = dev_array_allocate<F>(p);
-    F *d_lagrange = dev_array_allocate<F>(p*R_round); 
 
     {
     index_t db = 32*32;
@@ -4415,14 +4428,12 @@ void gpu_coeff(index_t p, index_t k, index_t first,
 
     // d_lagrange has dimensions 7^k x P
 
-    gpu_47_yates4 STRASSEN_A_TEMPLATE (1, k, p, d_lagrange, d_alpha);
-    gpu_47_yates4 STRASSEN_B_TEMPLATE (1, k, p, d_lagrange, d_beta);
-    gpu_47_yates4 STRASSEN_C_TEMPLATE (1, k, p, d_lagrange, d_gamma);
+    gpu_47_yates4 STRASSEN_A_TEMPLATE (1, k, p, d_lagrange, d_alpha, d_s, d_s + p*4*(R/7));
+    gpu_47_yates4 STRASSEN_B_TEMPLATE (1, k, p, d_lagrange, d_beta,  d_s, d_s + p*4*(R/7));
+    gpu_47_yates4 STRASSEN_C_TEMPLATE (1, k, p, d_lagrange, d_gamma, d_s, d_s + p*4*(R/7));
 
     // Coefficient arrays have dimensions 4^k x P 
     
-    dev_array_delete(d_lagrange);
-    dev_array_delete(d_lagrange_base);
 }
 
 /* Evaluation at p points. */
@@ -4430,7 +4441,10 @@ void gpu_coeff(index_t p, index_t k, index_t first,
 template <typename F>
 void gpu_binom62_linear_poly(index_t p_in, index_t k, 
                              coeff_tab<F> &pre,
-                             F *chi, index_t first, F *Px0_in)
+                             F *d_chi_base, 
+                             index_t first, 
+                             F *Px0_in,
+                             F *d_scratch)
 {
     index_t n = 1L << k;
 
@@ -4442,20 +4456,6 @@ void gpu_binom62_linear_poly(index_t p_in, index_t k,
 
     assert(p >= 4); // will work with 4-vectorization over p
 
-    metric_push(m_gpu_eval_detail);
-
-    // Upload chi matrices in interleaved form
-    F *chi_i = array_allocate<F>(15*n*n);
-    for(index_t i = 0; i < 15; i++) {
-        for(index_t j = 0; j < n*n; j++) {
-            index_t jj = to_interleaved(k, j);
-            chi_i[i*n*n+jj] = chi[i*n*n+j];
-        }
-    }
-    F *d_chi_base = dev_array_allocate<F>(15*n*n);
-    dev_array_upload(15*n*n, chi_i, d_chi_base);
-    array_delete(chi_i);
-    
     F *d_chi_ab = d_chi_base +  0*n*n;
     F *d_chi_ac = d_chi_base +  1*n*n;
     F *d_chi_ad = d_chi_base +  2*n*n;
@@ -4472,81 +4472,86 @@ void gpu_binom62_linear_poly(index_t p_in, index_t k,
     F *d_chi_df = d_chi_base + 13*n*n;
     F *d_chi_ef = d_chi_base + 14*n*n;
     
-    // Compute the coefficient arrays
-    F *d_alpha = dev_array_allocate<F>(n*n*p);  
-    F *d_beta  = dev_array_allocate<F>(n*n*p);   
-    F *d_gamma = dev_array_allocate<F>(n*n*p); 
+    F *d_chi   = d_scratch + 0*n*n*p;
+    F *d_alpha = d_scratch + 1*n*n*p;
+    F *d_beta  = d_scratch + 2*n*n*p;
+    F *d_gamma = d_scratch + 3*n*n*p; 
 
     metric_push(m_gpu_eval_detail);
 
-    gpu_coeff(p, k, first, pre, d_alpha, d_beta, d_gamma);
+    index_t R = index_pow(7, k);
+    index_t R_round = ((R+8192-1)/8192)*8192;
+    index_t p_round = ((p+8192-1)/8192)*8192;
+    
+    F *d_lagrange_base = d_scratch + 4*n*n*p;
+    F *d_lagrange      = d_scratch + 4*n*n*p + p_round;
+    F *d_s             = d_scratch + 4*n*n*p + p_round + p*R_round;
+
+    // Compute the coefficient arrays
+    gpu_coeff(p, k, first, pre, 
+              d_alpha, d_beta, d_gamma,
+              d_lagrange_base, d_lagrange, d_s);
 
     metric_pop(m_gpu_eval_detail, "coeff");
 
     // Coefficient arrays now have dimensions 4^k x P
 
-    // Allocate the chi array
-    F *d_chi = dev_array_allocate<F>(p*n*n);  
+    // Get some scratch
+    F *d_s1 = d_scratch + 4*n*n*p;
+    F *d_s2 = d_scratch + 4*n*n*p +   4*index_pow(7,k-2)*p*4;   
+    F *d_s3 = d_scratch + 4*n*n*p + 2*4*index_pow(7,k-2)*p*4;   
 
     // Compute the matrices H, K, L
-    F *d_H = dev_array_allocate<F>(n*n*p);
-    F *d_K = dev_array_allocate<F>(n*n*p);  
-    F *d_L = dev_array_allocate<F>(n*n*p);  
+    F *d_H = d_alpha;
+    F *d_K = d_beta;  
+    F *d_L = d_gamma;  
 
     metric_push(m_gpu_eval_detail);
 
     stretch(index_pow(4,k), p, d_chi_de, d_chi);
     gpu_mod_mul(n*n*p, d_alpha, d_chi, d_H);
     stretch(index_pow(4,k), p, d_chi_ae, d_chi);
-    gpu_strassen(1, k, p, d_chi, d_H, d_H);
+    gpu_strassen(1, k, p, d_chi, d_H, d_H, d_s1, d_s2, d_s3);
 
     stretch(index_pow(4,k), p, d_chi_ef, d_chi);
     gpu_mod_mul(n*n*p, d_beta, d_chi, d_K);
     stretch(index_pow(4,k), p, d_chi_bf, d_chi);
-    gpu_strassen(1, k, p, d_chi, d_K, d_K);
+    gpu_strassen(1, k, p, d_chi, d_K, d_K, d_s1, d_s2, d_s3);
 
     stretch(index_pow(4,k), p, d_chi_df, d_chi);
     gpu_mod_mul(n*n*p, d_gamma, d_chi, d_L);
     stretch(index_pow(4,k), p, d_chi_cd, d_chi);
-    gpu_strassen(0, k, p, d_chi, d_L, d_L);
+    gpu_strassen(0, k, p, d_chi, d_L, d_L, d_s1, d_s2, d_s3);
 
-    metric_pop(m_gpu_eval_detail, "HKL");
+    metric_pop(m_gpu_eval_detail, "HKL  ");
 
-    dev_array_delete(d_alpha);
-    dev_array_delete(d_beta);
-    dev_array_delete(d_gamma);
-    
     // Compute the matrices A, B, C
-    F *d_A = dev_array_allocate<F>(n*n*p);  
-    F *d_B = dev_array_allocate<F>(n*n*p);  
-    F *d_C = dev_array_allocate<F>(n*n*p);  
+    F *d_A = d_H;  
+    F *d_B = d_K;  
+    F *d_C = d_L;  
 
     metric_push(m_gpu_eval_detail);
 
     stretch(index_pow(4,k), p, d_chi_ad, d_chi);
     gpu_mod_mul(n*n*p, d_H, d_chi, d_A);
     stretch(index_pow(4,k), p, d_chi_bd, d_chi);
-    gpu_strassen(1, k, p, d_A, d_chi, d_A);
+    gpu_strassen(1, k, p, d_A, d_chi, d_A, d_s1, d_s2, d_s3);
 
     stretch(index_pow(4,k), p, d_chi_be, d_chi);
     gpu_mod_mul(n*n*p, d_K, d_chi, d_B);
     stretch(index_pow(4,k), p, d_chi_ce, d_chi);
-    gpu_strassen(1, k, p, d_B, d_chi, d_B);
+    gpu_strassen(1, k, p, d_B, d_chi, d_B, d_s1, d_s2, d_s3);
 
     stretch(index_pow(4,k), p, d_chi_cf, d_chi);
     gpu_mod_mul(n*n*p, d_L, d_chi, d_C);
     stretch(index_pow(4,k), p, d_chi_af, d_chi);
-    gpu_strassen(1, k, p, d_chi, d_C, d_C);
+    gpu_strassen(1, k, p, d_chi, d_C, d_C, d_s1, d_s2, d_s3);
 
-    metric_pop(m_gpu_eval_detail, "ABC");
-
-    dev_array_delete(d_H);
-    dev_array_delete(d_K);
-    dev_array_delete(d_L);
+    metric_pop(m_gpu_eval_detail, "ABC  ");
 
     // Compute the matrix Q
 
-    F *d_Q = dev_array_allocate<F>(n*n*p);
+    F *d_Q = d_B;
 
     metric_push(m_gpu_eval_detail);
 
@@ -4555,16 +4560,11 @@ void gpu_binom62_linear_poly(index_t p_in, index_t k,
     stretch(index_pow(4,k), p, d_chi_ac, d_chi);
     gpu_mod_mul(n*n*p, d_C, d_chi, d_C);
 
-    gpu_strassen(1, k, p, d_C, d_B, d_Q);
+    gpu_strassen(1, k, p, d_C, d_B, d_Q, d_s1, d_s2, d_s3);
     
-    dev_array_delete(d_B);
-    dev_array_delete(d_C);
-
     stretch(index_pow(4,k), p, d_chi_ab, d_chi);
     gpu_mod_mul(n*n*p, d_chi, d_Q, d_Q);
     gpu_mod_mul(n*n*p, d_Q, d_A, d_A);
-    
-    dev_array_delete(d_Q);
 
     // Transpose data before reduction
 
@@ -4573,29 +4573,26 @@ void gpu_binom62_linear_poly(index_t p_in, index_t k,
               n*n,
               n*n,
               1,
-              d_A);
+              d_A,
+              d_Q,
+              true);
 
-    gpu_mod_add_reduce(p, n*n, d_A, d_chi);
+    gpu_mod_add_reduce(p, n*n, d_Q, d_chi);
 
-    metric_pop(m_gpu_eval_detail, "Qre");
+    metric_pop(m_gpu_eval_detail, "Qre  ");
 
     dev_array_download(p, d_chi, Px0);
-    
-    dev_array_delete(d_A);
-    dev_array_delete(d_chi);
-    dev_array_delete(d_chi_base);
-
-    metric_pop(m_gpu_eval_detail, "tot");
-
-    metric_pop(m_gpu_eval, 
-               "p = %4ld, n = %4ld, R = %8ld, N = %9ld, first = %9ld", 
-               p, n, index_pow(7, k), 3*index_pow(7, k)-2, first);
 
     // Copy result
     for(index_t i = 0; i < p_in; i++)
         Px0_in[i] = Px0[i];
 
     array_delete(Px0);
+
+    metric_pop(m_gpu_eval, 
+               "p = %4ld, n = %4ld, R = %8ld, N = %9ld, first = %9ld", 
+               p, n, index_pow(7, k), 3*index_pow(7, k)-2, first);
+
 }
 
 
@@ -4681,15 +4678,41 @@ int work(int argc, char **argv)
         for(index_t j = 0; j < points; j++)
             x[j] = F(first + j);
 
+        // Upload chi matrices in interleaved form
+        F *chi_i = array_allocate<F>(15*n*n);
+        for(index_t i = 0; i < 15; i++) {
+            for(index_t j = 0; j < n*n; j++) {
+                index_t jj = to_interleaved(k, j);
+                chi_i[i*n*n+jj] = chi[i*n*n+j];
+            }
+        }
+        F *d_chi_base = dev_array_allocate<F>(15*n*n);
+        dev_array_upload(15*n*n, chi_i, d_chi_base);
+        array_delete(chi_i);
+
+        index_t p = batch;
+        index_t R_round = ((R+8192-1)/8192)*8192;
+        index_t p_round = ((p+8192-1)/8192)*8192;
+        index_t cap  = 4*n*n*p + p_round + p*R_round + p*(4*(R/7)+4*4*((R/7)/7));
+        index_t cap2 = 4*n*n*p + 3*4*index_pow(7,k-2)*p*4;
+        if(cap2 > cap)
+            cap = cap2;
+        F *d_scratch = dev_array_allocate<F>(cap);
+
         metric_push(m_default);
         for(index_t i = 0; i < (points+batch-1)/batch; i++)
             gpu_binom62_linear_poly((i+1)*batch < points ? batch : points-i*batch,
                                     k,
                                     pre,
-                                    chi, 
+                                    d_chi_base, 
                                     first + i*batch, 
-                                    y + i*batch);
+                                    y + i*batch,
+                                    d_scratch);
         metric_pop(m_default, "time");
+
+        dev_array_delete(d_scratch);
+
+        dev_array_delete(d_chi_base);
 
         gpu_coeff_release<F>(pre);
 
