@@ -11,7 +11,7 @@
  * 
  * The MIT License (MIT)
  * 
- * Copyright (c) 2017-2018 P. Kaski
+ * Copyright (c) 2017-2019 P. Kaski
  * 
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -142,7 +142,8 @@ T *array_allocate(std::size_t n)
         alloc_track_root.next = &alloc_track_root;
     }
     size_t size = sizeof(T)*n;
-    T *p = new T[n];
+    T *p = (T *) malloc(size); 
+    // T *p = new T[n];
     alloc_balance++;
 
     alloc_track_t *t = new alloc_track_t;
@@ -171,8 +172,8 @@ void array_delete(const T *p)
     alloc_total -= t->size;
     pnunlink(t);
     delete t;
-
-    delete[] p;
+    free((void *) p);
+    // delete[] p;
     alloc_balance--;
 }
 
@@ -1101,58 +1102,62 @@ void array_rev(index_t D, index_t N, const F *f, F *g)
  * T = 2^{t} = 2^{ceil(n/2)} = number of limbs in operand
  * M = 2^{m} = 2^{floor(n/2)} = number of F-scalars in limb
  *
- * Observe that N == T*M and, equivalently, n==t+m.
+ * Observe that N == T*M and, equivalently, n==t+m. Furthermore, M <= T <= 2M.
  *
  * Description:
  *
  * To execute one multiplication in the quotient ring F[x] / <x^{N}+1>, 
- * the algorithm will recurse with 2T multiplications in F[x] / <x^{2M}+1>. 
+ * the algorithm will recurse with T multiplications in F[x] / <x^{2M}+1>.
  *
- * The recursion is enabled by a 2T-point FFT using a primitive root
- * of unity of degree 2T in F[x] / <x^{2M}+1>. This primitive root
- * w is 
+ * The recursion is enabled by a T-point FFT using a primitive root
+ * of unity of degree T in F[x] / <x^{2M}+1>. This primitive root w is 
  *
- *    w = x   (mod x^{2M}+1)  if T = 2M 
+ *    w = x^2  (mod x^{2M}+1)   if T = 2M 
  *
  * and 
  * 
- *    w = x^2 (mod x^{2M}+1)  if T = M.
+ *    w = x^4  (mod x^{2M}+1)   if T = M.
  * 
- * The FFT is implemented as a Cooley-Tukey decimation-in-frequency radix-2 FFT
- * that outputs in bit-reversed (transposed) order of the indices 
- * relative to the natural (input) order. 
+ * The FFT is implemented as a Cooley-Tukey radix-2 FFT that outputs in 
+ * bit-reversed (transposed) order of the indices relative to the natural 
+ * (input) order. 
  * 
  */
 
-#define SIZE(a,b,c) (1L << ((a)+(b)+(c)))
-#define DIGIT2(u,a,b,c) ((u) >> (b+c))
-#define DIGIT1(u,a,b,c) (((u) >> (c))&((1L << (b))-1))
-#define DIGIT0(u,a,b,c) ((u)&((1L << (c))-1))
-#define BUILD(x,y,z,a,b,c) ((x) << ((b)+(c)))+((y) << (c))+(z)
+#define SIZE(a,b,c)         (1L << ((a)+(b)+(c)))
+#define DIGIT2(u,a,b,c)     ((u) >> ((b)+(c)))
+#define DIGIT1(u,a,b,c)     (((u) >> (c)) & ((1L << (b))-1))
+#define DIGIT0(u,a,b,c)     ((u) & ((1L << (c))-1))
+#define BUILD(x,y,z,a,b,c)  ((x) << ((b)+(c)))+((y) << (c))+(z)
+#define MOD(v,n)            ((v) & ((1L << (n)) - 1))
+#define NEG(j,s,n)          (MOD(MOD((j)-(s),n)+(s),(n)+1) >= (1L << (n)))
 
-/* Expand from (d,t,m) to (d,t+1,m+1). */
+/* Expand from (d,t,m) to (d,t,m+1). */
 
 template <typename F>
 void ss_expand(index_t d, index_t t, index_t m, const F *in, F *out)
 {   
     metric_push(m_ss_layers);
-#pragma omp parallel for if(SIZE(d,t+1,m+1) >= par_threshold)
-    for(index_t v = 0; v < SIZE(d,t+1,m+1); v++) { 
-        index_t i = DIGIT2(v,d,t+1,m+1);
-        index_t j = DIGIT1(v,d,t+1,m+1);
-        index_t k = DIGIT0(v,d,t+1,m+1);
-        index_t u = BUILD(i,j,k,d,t,m);
-        out[v] = ((j >= (1L << t)) || (k >= (1L << m))) ? F::zero : in[u];
+#pragma omp parallel for if(SIZE(d,t,m+1) >= par_threshold)
+    for(index_t v = 0; v < SIZE(d,t,m+1); v++) { 
+        index_t p  = DIGIT2(v,d,t,m+1);
+        index_t i  = DIGIT1(v,d,t,m+1);
+        index_t j  = DIGIT0(v,d,t,m+1);
+        index_t s  = i << (m+1-t);       
+        index_t js = MOD(j-s, m+1);
+        index_t u  = BUILD(p,i,js,d,t,m);        
+        F t = (js < (1L << m)) ? in[u] : F::zero;
+        out[v] = NEG(j, s, m+1) ? -t : t;
     }
     double time = metric_time(m_ss_layers);
-    double trans_bytes = 5*sizeof(F)*(1L << (d+t+m));   
+    double trans_bytes = 3*sizeof(F)*(1L << (d+t+m));   
     metric_pop(m_ss_layers,
                "expand:   "
                "d = %2ld, t = %2ld, m = %2ld         (%6.2lfGiB/s)", 
                d, t, m, trans_bytes/((double)(1L << 30))/(time/1000.0));
 }
 
-/* Compress from (l,t+1,m+1) to (l,t,m) with x^{2M} = -1. */
+/* Compress from (l,t,m+1) to (l,t,m). */
 
 template <typename F>
 void ss_compress(index_t d, index_t t, index_t m, const F *in, F *out)
@@ -1160,23 +1165,28 @@ void ss_compress(index_t d, index_t t, index_t m, const F *in, F *out)
     metric_push(m_ss_layers);
 #pragma omp parallel for if(SIZE(d,t,m) >= par_threshold)
     for(index_t v = 0; v < SIZE(d,t,m); v++) {
-        index_t M = 1L << m;
-        index_t T = 1L << t;
-        index_t i = DIGIT2(v,d,t,m);
-        index_t j = DIGIT1(v,d,t,m);
-        index_t k = DIGIT0(v,d,t,m);
-        index_t j_minus_1 = (j-1)&((1L << (t+1))-1);
-        index_t u0 = BUILD(i, j,         k,   d,t+1,m+1);
-        index_t u1 = BUILD(i, j_minus_1, k+M, d,t+1,m+1);
-        index_t u2 = BUILD(i, j+T,       k,   d,t+1,m+1);
-        index_t u3 = BUILD(i, j+T-1,     k+M, d,t+1,m+1);
-        F t0 = in[u0] + in[u1];
-        F t1 = in[u2] + in[u3];
-        t0 = t0 - t1;
-        out[v] = t0;
+        index_t M    = 1L << m;
+        index_t T    = 1L << t;
+        index_t p    = DIGIT2(v,d,t,m);
+        index_t i    = DIGIT1(v,d,t,m);
+        index_t j    = DIGIT0(v,d,t,m);   
+        index_t i1   = (i-1) & (T-1);
+        index_t jM   = j+M;
+        index_t s    = -(i << (m+1-t));      
+        index_t s1   = -(i1 << (m+1-t));
+        index_t js   = MOD(j-s,   m+1);
+        index_t jMs1 = MOD(jM-s1, m+1);
+        index_t u0   = BUILD(p, i,  js,   d, t, m+1);
+        index_t u1   = BUILD(p, i1, jMs1, d, t, m+1);
+        F t0 = in[u0];
+        F t1 = in[u1];
+        t0 = NEG(j,  s,  m+1) ? -t0 : t0;
+        t1 = NEG(jM, s1, m+1) ? -t1 : t1;
+        t1 = i1 > i ? -t1 : t1;     
+        out[v] = t0 + t1;
     }
     double time = metric_time(m_ss_layers);
-    double trans_bytes = 5*sizeof(F)*(1L << (d+t+m));
+    double trans_bytes = 3*sizeof(F)*(1L << (d+t+m));
     metric_pop(m_ss_layers,
                "compress: "
                "d = %2ld, t = %2ld, m = %2ld         (%6.2lfGiB/s)", 
@@ -1217,101 +1227,75 @@ void ss_base_mul(index_t d, index_t m, const F *x, const F *y, F *z)
 }
 
 
-/* Cooley-Tukey decimation-in-frequency 2T-point FFT over F[x] / <x^{2M}+1>. */
+/* Cooley-Tukey T-point FFT over F[x] / <x^{2M}+1>. */
 
-/* Forward (d,t+1,m+1) butterfly at level w = 0,1,...,t. */
+/* Forward (d,t,m+1) butterfly at level w = t-1,...,1,0. */
 
 template <typename F>
 void ss_butterfly_forward(index_t d, index_t t, index_t m, 
                           index_t w, 
                           const F *in, F *out)
 {
-#pragma omp parallel for if(SIZE(d,t+1,m+1) >= par_threshold)
-    for(index_t v = 0; v < SIZE(d,t+1,m+1); v++) {
-        index_t s = (t == m) ? 1 : 0;
-            // primitive 2T'th root of unity is x^{2^s}
-        index_t odd = (v >> (t-w+m+1))&1; 
-            // even or odd level-w output of the butterfly?
-        index_t jp = (v >> (m+1))&((1L << (t-w))-1);
-            // index 0,1,...,T/W-1 for signed shift
-        index_t shift = jp << (s+w);
-            // actual shift 0,1,...,2T-1 for odd output
-        index_t k = DIGIT0(v,d,t+1,m+1);
-            // extract coordinate to be shifted
-        index_t k_shifted = (k-shift)&((1L << (m+1))-1);
-            // do shift with cyclic 2M wrap
-        index_t negate = odd && (k < shift) && (shift <= k + (1L << (m+1)));
-            // negate odd output if shift did wrap around with x^{2M} == -1
-        index_t u_same = (v & ~((1L << (m+1))-1)) + (odd ? k_shifted : k);
-            // index to input with same parity (even or odd) as v
-        index_t u_opp  = u_same ^ (1L << (t-w+m+1));
-            // index to input with opposite parity (even or odd) as v
-        F t_same = in[u_same];
-            // read same-parity input
-        F t_opp = in[u_opp];
-            // read opposite-parity input
-        if(odd)
-            t_same = -t_same;
-            // negate same-parity input if odd parity
-        F t_sum = t_same + t_opp;
-            // sum inputs
-        if(negate)
-            t_sum = -t_sum;
-            // negate output if odd parity and wrapped around with x^{2M} == -1
-        out[v] = t_sum;
+#pragma omp parallel for if(SIZE(d,t,m+1) >= par_threshold)
+    for(index_t v = 0; v < SIZE(d,t,m+1); v++) {
+        index_t p  = DIGIT2(v,d,t,m+1);
+        index_t i  = DIGIT1(v,d,t,m+1);
+        index_t j  = DIGIT0(v,d,t,m+1);
+        index_t iw = (i >> w)&1;
+        index_t W  = 1L << w;
+        index_t i0 = i & ~W;
+        index_t i1 = i | W;
+        index_t s  = (iw != 0) ? (i & (W-1)) << (m+1-w) : 0L; 
+        index_t js = MOD(j-s,m+1);
+        index_t u0 = BUILD(p,i0,js,d,t,m+1);
+        index_t u1 = BUILD(p,i1,js,d,t,m+1); 
+        F t0 = in[u0];      
+        F t1 = in[u1];
+        t0 = NEG(j, s, m+1) ? -t0 : t0;
+        t1 = NEG(j, s, m+1) ? -t1 : t1;
+        out[v] = (iw != 0) ? t0-t1 : t0+t1;
     }
 }
 
-/* Inverse (d,t+1,m+1) butterfly at level w = 0,1,...,t. */
+/* Inverse (d,t,m+1) butterfly at level w = 0,1,...,t-1. */
 
 template <typename F>
 void ss_butterfly_inverse(index_t d, index_t t, index_t m, 
                           index_t w, 
                           const F *in, F *out)
 {
-#pragma omp parallel for if(SIZE(d,t+1,m+1) >= par_threshold)
-    for(index_t v = 0; v < SIZE(d,t+1,m+1); v++) {
-        index_t s = (t == m) ? 1 : 0;
-            // primitive 2T'th root of unity is x^{2^s}
-        index_t odd = (v >> (t-w+m+1))&1; 
-            // even or odd level-w output of the butterfly?
-        index_t jp = (v >> (m+1))&((1L << (t-w))-1);
-            // index 0,1,...,T/W-1 for signed shift
-        index_t shift = jp << (s+w);
-            // actual shift 0,1,...,2T-1 for odd output
-        index_t k = DIGIT0(v,d,t+1,m+1);
-            // extract coordinate to be shifted
-        index_t k_shifted = (k+shift)&((1L << (m+1))-1);
-            // do shift with cyclic 2M wrap
-        index_t negate = (k_shifted < shift) && 
-                         (shift <= k_shifted + (1L << (m+1)));
-            // negate odd input if shift did wrap around with x^{2M} == -1
-        index_t u_base = (v & ~((1L << (m+1))-1));
-        index_t flip = (1L << (t-w+m+1));
-        index_t u_even_base = u_base ^ (odd ? flip : 0L);
-        index_t u_odd_base  = u_even_base ^ flip;
-        index_t u_even = u_even_base + k;
-        index_t u_odd  = u_odd_base + k_shifted;
-        F t_even = in[u_even];
-        F t_odd  = in[u_odd];
-        if(negate^odd)
-            t_odd = -t_odd;
-        F t_sum = t_even + t_odd;
-        out[v] = t_sum;
+#pragma omp parallel for if(SIZE(d,t,m+1) >= par_threshold)
+    for(index_t v = 0; v < SIZE(d,t,m+1); v++) {
+        index_t p  = DIGIT2(v,d,t,m+1);
+        index_t i  = DIGIT1(v,d,t,m+1);
+        index_t j  = DIGIT0(v,d,t,m+1);
+        index_t iw = (i >> w)&1;
+        index_t W  = 1L << w;       
+        index_t i0 = i & ~W;
+        index_t i1 = i | W;
+        index_t s1 = -((i1 & (W-1)) << (m+1-w));
+        index_t j0 = j;
+        index_t j1 = MOD(j-s1,m+1);     
+        index_t u0 = BUILD(p,i0,j0,d,t,m+1);
+        index_t u1 = BUILD(p,i1,j1,d,t,m+1);        
+        F t0 = in[u0];      
+        F t1 = in[u1];
+        t1 = NEG(j, s1, m+1) ? -t1 : t1;
+        out[v] = (iw != 0) ? t0-t1 : t0+t1;
     }
 }
 
-/* Forward (d,t+1,m+1) FFT. Output is in bit-reversed order. */
+/* Forward (d,t,m+1) FFT. Output is in bit-reversed order. */
 
 template <typename F>
 F *ss_fft_forward(index_t d, index_t t, index_t m, 
                   F *in, F *scratch)
 {
-    for(index_t w = 0; w <= t; w++) {
+    for(index_t w = t-1; w >= 0; w--) {
         metric_push(m_ss_layers);
         ss_butterfly_forward(d, t, m, w, in, scratch);
         double time = metric_time(m_ss_layers);
-        double trans_bytes = 3*sizeof(F)*(1L << (d+t+1+m+1));
+        double trans_bytes = 3*sizeof(F)*(1L << (d+t+m+1));
         metric_pop(m_ss_layers,
                    "forward:  "
                    "d = %2ld, t = %2ld, m = %2ld, w = %2ld (%6.2lfGiB/s)", 
@@ -1323,21 +1307,21 @@ F *ss_fft_forward(index_t d, index_t t, index_t m,
     return in;
 }
 
-/* Inverse (d,t+1,m+1) FFT. Assumes input is in bit-reversed order. */
+/* Inverse (d,t,m+1) FFT. Assumes input is in bit-reversed order. */
 
 template <typename F>
 F *ss_fft_inverse(index_t d, index_t t, index_t m, 
                   F *in, F *scratch)
 {
-    F z = F::inv_2_pow_k(t+1);
-    array_scalar_mul(1L << (d+t+1+m+1), in,
+    F z = F::inv_2_pow_k(t);
+    array_scalar_mul(1L << (d+t+m+1), in,
                      z,
-                     1L << (d+t+1+m+1), in);
-    for(index_t w = t; w >= 0; w--) {
+                     1L << (d+t+m+1), in);
+    for(index_t w = 0; w < t; w++) {
         metric_push(m_ss_layers);
         ss_butterfly_inverse(d, t, m, w, in, scratch);
         double time = metric_time(m_ss_layers);
-        double trans_bytes = 3*sizeof(F)*(1L << (d+t+1+m+1));
+        double trans_bytes = 3*sizeof(F)*(1L << (d+t+m+1));
         metric_pop(m_ss_layers,
                    "inverse:  "
                    "d = %2ld, t = %2ld, m = %2ld, w = %2ld (%6.2lfGiB/s)", 
@@ -1356,7 +1340,7 @@ void host_ss_mul(index_t d, index_t n, const F *x, const F *y, F *z)
 {
     assert(n >= 0);
 
-    if(n <= 10) { // was 10, was 12
+    if(n <= 9) {
         bool have_buf = false;
         F *out = z;
         if(x == z || y == z) {
@@ -1378,28 +1362,31 @@ void host_ss_mul(index_t d, index_t n, const F *x, const F *y, F *z)
     index_t t = n-m;
     assert(m <= t);
 
-    F *xe  = array_allocate<F>(1L << (d+t+1+m+1));
-    F *xes = array_allocate<F>(1L << (d+t+1+m+1));
+    F *master_buf = array_allocate<F>(3*(1L << (d+t+m+1)));
+
+    F *xe  = master_buf;
+    F *xes = master_buf + (1L << (d+t+m+1));
     ss_expand(d, t, m, x, xe);
     F *xef = ss_fft_forward(d, t, m, xe, xes);
+    F *reclaimed;
     if(xef == xe)
-        array_delete(xes);
+        reclaimed = xes;
     else
-        array_delete(xe);
+        reclaimed = xe;
 
-    F *ye  = array_allocate<F>(1L << (d+t+1+m+1));
-    F *yes = array_allocate<F>(1L << (d+t+1+m+1));
+    F *ye  = master_buf + 2*(1L << (d+t+m+1));
+    F *yes = reclaimed;
     ss_expand(d, t, m, y, ye);
     F *yef = ss_fft_forward(d, t, m, ye, yes);
     if(yef == ye)
-        array_delete(yes);
+        reclaimed = yes;
     else
-        array_delete(ye);
+        reclaimed = ye;
 
-    F *zef = array_allocate<F>(1L << (d+t+1+m+1));
-    index_t calls = d+t+1;
+    F *zef = reclaimed;
+    index_t calls = d+t;
     index_t block = 0;
-    while(block + m + 1 < 25 && calls > 0) {
+    while(block + m + 1 < 26 && calls > 0) {
         block++;
         calls--;
     }
@@ -1409,52 +1396,48 @@ void host_ss_mul(index_t d, index_t n, const F *x, const F *y, F *z)
     F *zp = zef;
     for(index_t c = 0; c < (1L << calls); c++) {
         ss_mul(block, m+1, xp, yp, zp);
-//        host_ss_mul(block, m+1, xp, yp, zp);
         xp = xp + (1L << (block + m + 1));
         yp = yp + (1L << (block + m + 1));
         zp = zp + (1L << (block + m + 1));      
     }
 
-    array_delete(yef);
-    array_delete(xef);
+    reclaimed = yef;
+    // zef is also free at this point
 
-    F *zes = array_allocate<F>(1L << (d+t+1+m+1));
+    F *zes = reclaimed;
     F *ze = ss_fft_inverse(d, t, m, zef, zes);
-
-    if(ze == zef)
-        array_delete(zes);
-    else
-        array_delete(zef);
 
     ss_compress(d, t, m, ze, z);
 
-    array_delete(ze);
+    array_delete(master_buf);
+
 }
 
 
 /********************************************************************* CUDA. */
 
-/* Expand from (d,t,m) to (d,t+1,m+1). */
+/* Expand from (d,t,m) to (d,t,m+1). */
 
 template <typename F>
 __global__
-void ker_expand(index_t d, index_t t, index_t m, 
-                F *d_in, F *d_out)
+void ker_expand(index_t d, index_t t, index_t m, F *d_in, F *d_out)
 {   
-    index_t v = blockDim.x*(blockIdx.x+blockIdx.y*gridDim.x)+threadIdx.x;
-    index_t i = DIGIT2(v,d,t+1,m+1);
-    index_t j = DIGIT1(v,d,t+1,m+1);
-    index_t k = DIGIT0(v,d,t+1,m+1);
-    index_t u = BUILD(i,j,k,d,t,m);
-    d_out[v] = ((j >= (1L << t)) || (k >= (1L << m))) ? F(0U) : d_in[u];
+    index_t v  = blockDim.x*(blockIdx.x+blockIdx.y*gridDim.x)+threadIdx.x;
+    index_t p  = DIGIT2(v,d,t,m+1);
+    index_t i  = DIGIT1(v,d,t,m+1);
+    index_t j  = DIGIT0(v,d,t,m+1);
+    index_t s  = i << (m+1-t);       
+    index_t js = MOD(j-s, m+1);
+    index_t u  = BUILD(p,i,js,d,t,m);        
+    F e = (js < (1L << m)) ? d_in[u] : F(0U);
+    d_out[v] = NEG(j, s, m+1) ? -e : e;
 }
 
 template <typename F>
-void dev_expand(index_t d, index_t t, index_t m, 
-                F *d_in, F *d_out)
+void dev_expand(index_t d, index_t t, index_t m, F *d_in, F *d_out)
 {   
     metric_push(m_gpu_ss_layers);
-    index_t dg = d+t+1+m+1 - 5; assert(dg >= 0);
+    index_t dg = d+t+m+1 - 5; assert(dg >= 0);
     index_t dgx = dg >= 16 ? 15 : dg;
     index_t dgy = dg >= 16 ? dg - 15 : 0;
     dim3 dg2(1 << dgx, 1 << dgy);
@@ -1462,40 +1445,43 @@ void dev_expand(index_t d, index_t t, index_t m,
     ker_expand<<<dg2,db2>>>(d, t, m, d_in, d_out); 
     CUDA_SYNC;
     double time = metric_time(m_gpu_ss_layers);
-    double trans_bytes = 5*sizeof(F)*(1L << (d+t+m));
+    double trans_bytes = 3*sizeof(F)*(1L << (d+t+m));
     metric_pop(m_gpu_ss_layers,
                "dev_expand:   "
                "d = %2ld, t = %2ld, m = %2ld         (%6.2lfGiB/s)", 
                d, t, m, trans_bytes/((double)(1L << 30))/(time/1000.0));
 }
 
-/* Compress from (l,t+1,m+1) to (l,t,m) with x^{2M} = -1. */
+/* Compress from (l,t,m+1) to (l,t,m). */
 
 template <typename F>
 __global__
-void ker_compress(index_t d, index_t t, index_t m, 
-                  F *d_in, F *d_out)
+void ker_compress(index_t d, index_t t, index_t m, F *d_in, F *d_out)
 {   
-    index_t v = blockDim.x*(blockIdx.x+blockIdx.y*gridDim.x)+threadIdx.x;
-    index_t M = 1L << m;
-    index_t T = 1L << t;
-    index_t i = DIGIT2(v,d,t,m);
-    index_t j = DIGIT1(v,d,t,m);
-    index_t k = DIGIT0(v,d,t,m);
-    index_t j_minus_1 = (j-1)&((1L << (t+1))-1);
-    index_t u0 = BUILD(i, j,         k,   d,t+1,m+1);
-    index_t u1 = BUILD(i, j_minus_1, k+M, d,t+1,m+1);
-    index_t u2 = BUILD(i, j+T,       k,   d,t+1,m+1);
-    index_t u3 = BUILD(i, j+T-1,     k+M, d,t+1,m+1);
-    F t0 = d_in[u0] + d_in[u1];
-    F t1 = d_in[u2] + d_in[u3];
-    t0 = t0 - t1;
-    d_out[v] = t0;
+    index_t v    = blockDim.x*(blockIdx.x+blockIdx.y*gridDim.x)+threadIdx.x;
+    index_t M    = 1L << m;
+    index_t T    = 1L << t;
+    index_t p    = DIGIT2(v,d,t,m);
+    index_t i    = DIGIT1(v,d,t,m);
+    index_t j    = DIGIT0(v,d,t,m);   
+    index_t i1   = (i-1) & (T-1);
+    index_t jM   = j+M;
+    index_t s    = -(i << (m+1-t));      
+    index_t s1   = -(i1 << (m+1-t));
+    index_t js   = MOD(j-s,   m+1);
+    index_t jMs1 = MOD(jM-s1, m+1);
+    index_t u0   = BUILD(p, i,  js,   d, t, m+1);
+    index_t u1   = BUILD(p, i1, jMs1, d, t, m+1);
+    F t0 = d_in[u0];
+    F t1 = d_in[u1];
+    t0 = NEG(j,  s,  m+1) ? -t0 : t0;
+    t1 = NEG(jM, s1, m+1) ? -t1 : t1;
+    t1 = i1 > i ? -t1 : t1;     
+    d_out[v] = t0 + t1;
 }
 
 template <typename F>
-void dev_compress(index_t d, index_t t, index_t m, 
-                  F *d_in, F *d_out)
+void dev_compress(index_t d, index_t t, index_t m, F *d_in, F *d_out)
 {   
     metric_push(m_gpu_ss_layers);
     index_t dg = d+t+m - 5; assert(dg >= 0);
@@ -1506,7 +1492,7 @@ void dev_compress(index_t d, index_t t, index_t m,
     ker_compress<<<dg2,db2>>>(d, t, m, d_in, d_out);
     CUDA_SYNC;
     double time = metric_time(m_gpu_ss_layers);
-    double trans_bytes = 5*sizeof(F)*(1L << (d+t+m));
+    double trans_bytes = 3*sizeof(F)*(1L << (d+t+m));
     metric_pop(m_gpu_ss_layers,
                "dev_compress: "
                "d = %2ld, t = %2ld, m = %2ld         (%6.2lfGiB/s)", 
@@ -1517,8 +1503,7 @@ void dev_compress(index_t d, index_t t, index_t m,
 
 template <typename F>
 __global__
-void ker_base_mul(index_t d, index_t m, 
-                  F *d_x, F *d_y, F *d_z)
+void ker_base_mul(index_t d, index_t m, F *d_x, F *d_y, F *d_z)
 {   
     index_t v = blockDim.x*(blockIdx.x+blockIdx.y*gridDim.x)+threadIdx.x;
     index_t L = 1L << (m+1);
@@ -1540,8 +1525,7 @@ void ker_base_mul(index_t d, index_t m,
 }
 
 template <typename F>
-void dev_base_mul(index_t d, index_t m, 
-                  F *d_x, F *d_y, F *d_z)
+void dev_base_mul(index_t d, index_t m, F *d_x, F *d_y, F *d_z)
 {   
     metric_push(m_gpu_ss_layers);
     index_t dg = d+m+1 - 5; assert(dg >= 0);
@@ -1559,7 +1543,7 @@ void dev_base_mul(index_t d, index_t m,
                 d, m+1, mul_count/1e9/(time/1000.0));
 }
 
-/* Cooley-Tukey decimation-in-frequency 2T-point FFT over F[x] / <x^{2M}+1>. */
+/* Cooley-Tukey T-point FFT over F[x] / <x^{2M}+1>. */
 
 /* Scalar multiplication kernel. */
 
@@ -1571,7 +1555,7 @@ void ker_poly_scalar_mul(F *d_in, F *d_out, F s)
     d_out[v] = d_in[v] * s;
 }
 
-/* Forward (d,t+1,m+1) butterfly at level w = 0,1,...,t. */
+/* Forward (d,t,m+1) butterfly at level w = t-1,...,1,0. */
 
 template <typename F>
 __global__
@@ -1579,41 +1563,26 @@ void ker_butterfly_forward(index_t d, index_t t, index_t m,
                            index_t w, 
                            F *d_in, F *d_out)
 {
-    index_t v = blockDim.x*(blockIdx.x+blockIdx.y*gridDim.x)+threadIdx.x;
-    index_t s = (t == m) ? 1 : 0;
-        // primitive 2T'th root of unity is x^{2^s}
-    index_t odd = (v >> (t-w+m+1))&1; 
-        // even or odd level-w output of the butterfly?
-    index_t jp = (v >> (m+1))&((1L << (t-w))-1);
-        // index 0,1,...,T/W-1 for signed shift
-    index_t shift = jp << (s+w);
-        // actual shift 0,1,...,2T-1 for odd output
-    index_t k = DIGIT0(v,d,t+1,m+1);
-        // extract coordinate to be shifted
-    index_t k_shifted = (k-shift)&((1L << (m+1))-1);
-        // do shift with cyclic 2M wrap
-    index_t negate = odd && (k < shift) && (shift <= k + (1L << (m+1)));
-        // negate odd output if shift did wrap around with x^{2M} == -1
-    index_t u_same = (v & ~((1L << (m+1))-1)) + (odd ? k_shifted : k);
-        // index to input with same parity (even or odd) as v
-    index_t u_opp  = u_same ^ (1L << (t-w+m+1));
-        // index to input with opposite parity (even or odd) as v
-    F t_same = d_in[u_same];
-        // read same-parity input
-    F t_opp = d_in[u_opp];
-        // read opposite-parity input
-    if(odd)
-        t_same = -t_same;
-        // negate same-parity input if odd parity
-    F t_sum = t_same + t_opp;
-        // sum inputs
-    if(negate)
-        t_sum = -t_sum;
-    // negate output if odd parity and wrapped around with x^{2M} == -1
-    d_out[v] = t_sum;
+    index_t v  = blockDim.x*(blockIdx.x+blockIdx.y*gridDim.x)+threadIdx.x;
+    index_t p  = DIGIT2(v,d,t,m+1);
+    index_t i  = DIGIT1(v,d,t,m+1);
+    index_t j  = DIGIT0(v,d,t,m+1);
+    index_t iw = (i >> w)&1;
+    index_t W  = 1L << w;
+    index_t i0 = i & ~W;
+    index_t i1 = i | W;
+    index_t s  = (iw != 0) ? (i & (W-1)) << (m+1-w) : 0L; 
+    index_t js = MOD(j-s,m+1);
+    index_t u0 = BUILD(p,i0,js,d,t,m+1);
+    index_t u1 = BUILD(p,i1,js,d,t,m+1); 
+    F t0 = d_in[u0];      
+    F t1 = d_in[u1];
+    t0 = NEG(j, s, m+1) ? -t0 : t0;
+    t1 = NEG(j, s, m+1) ? -t1 : t1;
+    d_out[v] = (iw != 0) ? t0-t1 : t0+t1;
 }
 
-/* Inverse (d,t+1,m+1) butterfly at level w = 0,1,...,t. */
+/* Inverse (d,t,m+1) butterfly at level w = 0,1,...,t. */
 
 template <typename F>
 __global__
@@ -1621,45 +1590,33 @@ void ker_butterfly_inverse(index_t d, index_t t, index_t m,
                            index_t w, 
                            F *d_in, F *d_out)
 {
-    index_t v = blockDim.x*(blockIdx.x+blockIdx.y*gridDim.x)+threadIdx.x;
-    index_t s = (t == m) ? 1 : 0;
-        // primitive 2T'th root of unity is x^{2^s}
-    index_t odd = (v >> (t-w+m+1))&1; 
-        // even or odd level-w output of the butterfly?
-    index_t jp = (v >> (m+1))&((1L << (t-w))-1);
-        // index 0,1,...,T/W-1 for signed shift
-    index_t shift = jp << (s+w);
-        // actual shift 0,1,...,2T-1 for odd output
-    index_t k = DIGIT0(v,d,t+1,m+1);
-        // extract coordinate to be shifted
-    index_t k_shifted = (k+shift)&((1L << (m+1))-1);
-        // do shift with cyclic 2M wrap
-    index_t negate = (k_shifted < shift) && 
-                         (shift <= k_shifted + (1L << (m+1)));
-        // negate odd input if shift did wrap around with x^{2M} == -1
-    index_t u_base = (v & ~((1L << (m+1))-1));
-    index_t flip = (1L << (t-w+m+1));
-    index_t u_even_base = u_base ^ (odd ? flip : 0L);
-    index_t u_odd_base  = u_even_base ^ flip;
-    index_t u_even = u_even_base + k;
-    index_t u_odd  = u_odd_base + k_shifted;
-    F t_even = d_in[u_even];
-    F t_odd  = d_in[u_odd];
-    if(negate^odd) 
-        t_odd = -t_odd;
-    F t_sum = t_even + t_odd;
-    d_out[v] = t_sum;
+    index_t v  = blockDim.x*(blockIdx.x+blockIdx.y*gridDim.x)+threadIdx.x;
+    index_t p  = DIGIT2(v,d,t,m+1);
+    index_t i  = DIGIT1(v,d,t,m+1);
+    index_t j  = DIGIT0(v,d,t,m+1);
+    index_t iw = (i >> w)&1;
+    index_t W  = 1L << w;       
+    index_t i0 = i & ~W;
+    index_t i1 = i | W;
+    index_t s1 = -((i1 & (W-1)) << (m+1-w));
+    index_t j0 = j;
+    index_t j1 = MOD(j-s1,m+1);     
+    index_t u0 = BUILD(p,i0,j0,d,t,m+1);
+    index_t u1 = BUILD(p,i1,j1,d,t,m+1);        
+    F t0 = d_in[u0];      
+    F t1 = d_in[u1];
+    t1 = NEG(j, s1, m+1) ? -t1 : t1;
+    d_out[v] = (iw != 0) ? t0-t1 : t0+t1;
 }
 
-/* Forward (d,t+1,m+1) FFT. Output is in bit-reversed order. */
+/* Forward (d,t,m+1) FFT. Output is in bit-reversed order. */
 
 template <typename F>
-F *dev_fft_forward(index_t d, index_t t, index_t m, 
-                   F *d_in, F *d_scratch)
+F *dev_fft_forward(index_t d, index_t t, index_t m, F *d_in, F *d_scratch)
 {
-    for(index_t w = 0; w <= t; w++) {
+    for(index_t w = t-1; w >= 0; w--) {
         metric_push(m_gpu_ss_layers);
-        index_t dg = d+t+1+m+1 - 5; assert(dg >= 0);
+        index_t dg = d+t+m+1 - 5; assert(dg >= 0);
         index_t dgx = dg >= 16 ? 15 : dg;
         index_t dgy = dg >= 16 ? dg - 15 : 0;
         dim3 dg2(1 << dgx, 1 << dgy);
@@ -1667,7 +1624,7 @@ F *dev_fft_forward(index_t d, index_t t, index_t m,
         ker_butterfly_forward<<<dg2,db2>>>(d, t, m, w, d_in, d_scratch);
         CUDA_SYNC;
         double time = metric_time(m_gpu_ss_layers);
-        double trans_bytes = 3*sizeof(F)*(1L << (d+t+1+m+1));
+        double trans_bytes = 3*sizeof(F)*(1L << (d+t+m+1));
         metric_pop(m_gpu_ss_layers,
                    "dev_forward:  "
                    "d = %2ld, t = %2ld, m = %2ld, w = %2ld (%6.2lfGiB/s)", 
@@ -1680,17 +1637,16 @@ F *dev_fft_forward(index_t d, index_t t, index_t m,
     return d_in;
 }
 
-/* Inverse (d,t+1,m+1) FFT. Assumes input is in bit-reversed order. */
+/* Inverse (d,t,m+1) FFT. Assumes input is in bit-reversed order. */
 
 template <typename F>
-F *dev_fft_inverse(index_t d, index_t t, index_t m, 
-                   F *d_in, F *d_scratch)
+F *dev_fft_inverse(index_t d, index_t t, index_t m, F *d_in, F *d_scratch)
 {
     {
-        F z = F::inv_2_pow_k(t+1);
+        F z = F::inv_2_pow_k(t);
 
         metric_push(m_gpu_ss_layers);
-        index_t dg = d+t+1+m+1 - 5; assert(dg >= 0);
+        index_t dg = d+t+m+1 - 5; assert(dg >= 0);
         index_t dgx = dg >= 16 ? 15 : dg;
         index_t dgy = dg >= 16 ? dg - 15 : 0;
         dim3 dg2(1 << dgx, 1 << dgy);
@@ -1698,7 +1654,7 @@ F *dev_fft_inverse(index_t d, index_t t, index_t m,
         ker_poly_scalar_mul<<<dg2,db2>>>(d_in, d_scratch, z);
         CUDA_SYNC;
         double time = metric_time(m_gpu_ss_layers);
-        double trans_bytes = 2*sizeof(F)*(1L << (d+t+1+m+1));
+        double trans_bytes = 2*sizeof(F)*(1L << (d+t+m+1));
         metric_pop(m_gpu_ss_layers, 
                    "dev_scalar:   "
                    "d = %2ld, t = %2ld, m = %2ld         (%6.2lfGiB/s)", 
@@ -1708,10 +1664,9 @@ F *dev_fft_inverse(index_t d, index_t t, index_t m,
         d_scratch = d_temp;
     }
     
-    for(index_t w = t; w >= 0; w--) {
-
+    for(index_t w = 0; w < t; w++) {
         metric_push(m_gpu_ss_layers);
-        index_t dg = d+t+1+m+1 - 5; assert(dg >= 0);
+        index_t dg = d+t+m+1 - 5; assert(dg >= 0);
         index_t dgx = dg >= 16 ? 15 : dg;
         index_t dgy = dg >= 16 ? dg - 15 : 0;
         dim3 dg2(1 << dgx, 1 << dgy);
@@ -1719,7 +1674,7 @@ F *dev_fft_inverse(index_t d, index_t t, index_t m,
         ker_butterfly_inverse<<<dg2,db2>>>(d, t, m, w, d_in, d_scratch);
         CUDA_SYNC;
         double time = metric_time(m_gpu_ss_layers);
-        double trans_bytes = 3*sizeof(F)*(1L << (d+t+1+m+1));
+        double trans_bytes = 3*sizeof(F)*(1L << (d+t+m+1));
         metric_pop(m_gpu_ss_layers,
                    "dev_inverse:  "
                    "d = %2ld, t = %2ld, m = %2ld, w = %2ld (%6.2lfGiB/s)", 
@@ -1735,12 +1690,11 @@ F *dev_fft_inverse(index_t d, index_t t, index_t m,
 /* Recursive (d,n),(d,n) -> (d,n) multiplication in F[x]/<x^N+1>. */
 
 template <typename F>
-void dev_ss_mul(index_t d, index_t n, 
-                F *d_x, F *d_y, F *d_z)
+void dev_ss_mul(index_t d, index_t n, F *d_x, F *d_y, F *d_z)
 {
     assert(n >= 1);
 
-    if(n <= 4) {
+    if(n <= 10) {
         dev_base_mul(d, n-1, d_x, d_y, d_z);
         return;
     }
@@ -1748,29 +1702,29 @@ void dev_ss_mul(index_t d, index_t n,
     index_t m = n/2;
     index_t t = n-m;
 
-    F *d_xe = dev_array_allocate<F>(1L << (d+t+1+m+1));
-    F *d_xes = dev_array_allocate<F>(1L << (d+t+1+m+1));
+    F *d_master_buf = dev_array_allocate<F>(3*(1L << (d+t+m+1))); 
+    F *d_xe  = d_master_buf;
+    F *d_xes = d_master_buf + (1L << (d+t+m+1));
     dev_expand(d, t, m, d_x, d_xe);
     F *d_xef = dev_fft_forward(d, t, m, d_xe, d_xes);
+    F *d_reclaimed;
     if(d_xef == d_xe)
-        dev_array_delete(d_xes);
+        d_reclaimed = d_xes;
     else
-        dev_array_delete(d_xe);
-
-    F *d_ye = dev_array_allocate<F>(1L << (d+t+1+m+1));
-    F *d_yes = dev_array_allocate<F>(1L << (d+t+1+m+1));
+        d_reclaimed = d_xe;
+    F *d_ye  = d_master_buf + 2*(1L << (d+t+m+1));
+    F *d_yes = d_reclaimed;
     dev_expand(d, t, m, d_y, d_ye);
     F *d_yef = dev_fft_forward(d, t, m, d_ye, d_yes);
     if(d_yef == d_ye)
-        dev_array_delete(d_yes);
+        d_reclaimed = d_yes;
     else
-        dev_array_delete(d_ye);
+        d_reclaimed = d_ye;
 
-    F *d_zef = dev_array_allocate<F>(1L << (d+t+1+m+1));
-    index_t calls = d+t+1;
+    F *d_zef = d_reclaimed;
+    index_t calls = d+t;
     index_t block = 0;
-    // was 24
-    while(block + m + 1 < 24 && calls > 0) {
+    while(block + m + 1 < 26 && calls > 0) {
         block++;
         calls--;
     }
@@ -1784,20 +1738,15 @@ void dev_ss_mul(index_t d, index_t n,
         d_zp = d_zp + (1L << (block + m + 1));      
     }
 
-    dev_array_delete(d_yef);
-    dev_array_delete(d_xef);
+    d_reclaimed = d_xef; 
+    // d_yef is also free at this point
 
-    F *d_zes = dev_array_allocate<F>(1L << (d+t+1+m+1));
+    F *d_zes = d_reclaimed;
     F *d_ze = dev_fft_inverse(d, t, m, d_zef, d_zes);
-
-    if(d_ze == d_zef)
-        dev_array_delete(d_zes);
-    else
-        dev_array_delete(d_zef);
 
     dev_compress(d, t, m, d_ze, d_z);
 
-    dev_array_delete(d_ze);
+    dev_array_delete(d_master_buf);
 
     // xe xes
     // xef
@@ -1807,20 +1756,19 @@ void dev_ss_mul(index_t d, index_t n,
     // zes ze
     // ze
     //
-    // peak working = 12 * D * N scalars (not including input and output); 
+    // peak working = 3 * 2 * D * N scalars (not including input and output); 
     // input and output = 3 * D * N scalars
-    // total = 15 * D * N scalars
-    //       = 60 * D * N bytes (with 4-byte scalars)
+    // total = 9 * D * N scalars
+    //       = 36 * D * N bytes (with 4-byte scalars)
     //
     //       ~ 6 + d + n (capacity for 33 assuming 8+ GiB glob)
-
+    //       [caveat: will also need capacity for the recursive call(s)]
 }
 
 /* Entry point for device multiplication. */
 
 template <typename F>
-void gpu_ss_mul(index_t d, index_t n, 
-                const F *x, const F *y, F *z)
+void gpu_ss_mul(index_t d, index_t n, const F *x, const F *y, F *z)
 {
     if(n == 0) {
         host_ss_mul(d, n, x, y, z);
@@ -1829,11 +1777,20 @@ void gpu_ss_mul(index_t d, index_t n,
     
     index_t N = 1L << (d+n);
 
-    F *d_x = dev_array_allocate<F>(N);
-    F *d_y = dev_array_allocate<F>(N);
-    F *d_z = dev_array_allocate<F>(N);
+    metric_push(m_gpu_ss);
+    F *d_buf = dev_array_allocate<F>(3*N);
+    F *d_x = d_buf;
+    F *d_y = d_buf + N;
+    F *d_z = d_buf + 2*N;
     dev_array_upload(N, x, d_x);
     dev_array_upload(N, y, d_y);
+    double time = metric_time(m_gpu_ss);
+    double trans_bytes = 2*N*sizeof(F);
+    metric_pop(m_gpu_ss,
+               "gpu_up:    "
+               "d = %2ld, n = %2ld, N = %10ld (%6.2lfGiB/s)"
+               "                                          ",
+               d, n, N, trans_bytes/(1L << 30)/(time/1000.0));
     metric_push(m_gpu_ss);
     push_time();
     dev_ss_mul(d, n, d_x, d_y, d_z);
@@ -1842,12 +1799,17 @@ void gpu_ss_mul(index_t d, index_t n,
                "gpu_ss:    "
                "d = %2ld, n = %2ld, N = %10ld"
                "                                                        ",
-               d, n, 1L << N);
-
+               d, n, N);
+    metric_push(m_gpu_ss);
     dev_array_download(N, d_z, z);
-    dev_array_delete(d_z);
-    dev_array_delete(d_y);
-    dev_array_delete(d_x);
+    dev_array_delete(d_buf);
+    time = metric_time(m_gpu_ss);
+    trans_bytes = N*sizeof(F);
+    metric_pop(m_gpu_ss,
+               "gpu_do:    "
+               "d = %2ld, n = %2ld, N = %10ld (%6.2lfGiB/s)"
+               "                                          ",
+               d, n, N, trans_bytes/(1L << 30)/(time/1000.0));
 }
 
 /***************************************************************** End CUDA. */
@@ -1855,10 +1817,9 @@ void gpu_ss_mul(index_t d, index_t n,
 /* Arbiter between host and device multiplication. */
 
 template <typename F>
-void ss_mul(index_t d, index_t n, 
-            const F *x, const F *y, F *z)
+void ss_mul(index_t d, index_t n, const F *x, const F *y, F *z)
 {
-    if(d+n >= 10 && d+n <= 27) { 
+    if(d+n >= 10 && d+n <= 28) { 
         gpu_ss_mul(d, n, x, y, z);
     } else {
         host_ss_mul(d, n, x, y, z);
@@ -1968,8 +1929,8 @@ void array_quorem_monic(index_t d,
 
     if(m > n) {
         for(index_t j = 0; j < (1L << d); j++)
-            for(index_t i = 0; i < n; i++)
-                r[j*n+i] = a[j*n+i];
+            for(index_t i = 0; i < m; i++)
+                r[j*m+i] = (i < n) ? a[j*n+i] : F::zero;
         // Caveat: should also set up a zero quotient.
         return;
     }
@@ -2395,9 +2356,10 @@ public:
         deg = deg <= 0 ? 1 : deg;
         index_t d = ceil_log2(deg+1)+1;
         index_t D = 1L << d;                
-        F *aa = array_allocate<F>(D);
-        F *bb = array_allocate<F>(D);
-        F *cc = array_allocate<F>(D);
+        F *buf = array_allocate<F>(3*D);
+        F *aa = buf;
+        F *bb = buf + D;
+        F *cc = buf + 2*D;
         array_scatter(1, a.cap, D, a.ptr.get(), aa);
         array_scatter(1, b.cap, D, b.ptr.get(), bb);
         ss_mul(0, d, aa, bb, cc);
@@ -2405,9 +2367,7 @@ public:
         if(deg < 0) { deg = 0; }
         Poly c(deg + 1);
         array_copy(deg + 1, cc, c.ptr.get());
-        array_delete(cc);
-        array_delete(bb);
-        array_delete(aa);
+        array_delete(buf);
         return c;
     }
     friend void quorem(const Poly& a, const Poly& b, Poly& q, Poly& r) {
@@ -2422,6 +2382,7 @@ public:
         } else {
             q = Poly(qd+1);
             r = Poly(bd+1); // must be able to save a zero remainder
+            r.ptr.get()[bd] = F::zero;
             array_poly_quorem(ad + 1, a.ptr.get(), 
                               bd + 1, b.ptr.get(), 
                               q.ptr.get(), 
@@ -2958,7 +2919,7 @@ void test_rs_perf(void)
 template <typename F>
 void test_mul_perf(void)
 {
-    for(index_t k = 0; k <= 25; k++) {
+    for(index_t k = 0; k <= 27; k++) {
         index_t n = 1L << k;
         Poly<F> f = Poly<F>::rand(n);
         Poly<F> g = Poly<F>::rand(n);
